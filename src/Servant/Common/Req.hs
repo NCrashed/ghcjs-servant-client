@@ -14,16 +14,12 @@ module Servant.Common.Req where
 #if !MIN_VERSION_base(4,8,0)
 import Control.Applicative
 #endif
-import Control.Exception
 import Control.Monad
-import Control.Monad.Catch (MonadThrow)
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Either
 import Data.ByteString.Lazy hiding (pack, filter, map, null, elem, unpack)
 import Data.ByteString.Char8 (unpack, pack)
 import qualified Data.ByteString as BS
-import Data.IORef
-import Data.String
 import Data.String.Conversions
 import Data.Proxy
 import Data.Text (Text)
@@ -39,23 +35,20 @@ import qualified Network.HTTP.Types.Header   as HTTP
 import Network.URI
 import Servant.API.ContentTypes
 import Servant.Common.BaseUrl
-import Servant.Common.Text
-import System.IO.Unsafe
-import GHCJS.Foreign (jsTrue, jsFalse)
-import GHCJS.Foreign.Callback (Callback (..)
+import GHCJS.Foreign (jsTrue)
+import GHCJS.Foreign.Callback (Callback ()
                               , OnBlocked(..)
                               , syncCallback)
 
 import Data.JSString (JSString)
 import qualified Data.JSString as JSString
+import Web.HttpApiData
 
 import GHCJS.Marshal
 import GHCJS.Prim --hiding (fromJSString, toJSString)
 import Control.Concurrent.MVar
-import Data.List.Split
 import Data.Maybe
 import Data.CaseInsensitive
-import Data.Char
 import Unsafe.Coerce
 import GHCJS.Foreign.QQ
 
@@ -121,9 +114,9 @@ appendToQueryString pname pvalue req =
   req { qs = qs req ++ [(pname, pvalue)]
       }
 
-addHeader :: ToText a => String -> a -> Req -> Req
+addHeader :: ToHttpApiData a => String -> a -> Req -> Req
 addHeader name val req = req { headers = headers req
-                                      ++ [(name, toText val)]
+                                      ++ [(name, decodeUtf8 $ toHeader val)]
                              }
 
 setRQBody :: IO JSVal -> MediaType -> Req -> Req
@@ -251,8 +244,8 @@ foreign import javascript unsafe "JSON.stringify($1)"
 
 xhrResponseHeaders :: JSVal -> IO [HTTP.Header]
 xhrResponseHeaders jReq = do
-  (headers :: JSString) <- jsXhrResponseHeaders jReq
-  let headersStrings = T.lines . T.pack . JSString.unpack $ headers
+  (headers' :: JSString) <- jsXhrResponseHeaders jReq
+  let headersStrings = T.lines . T.pack . JSString.unpack $ headers'
   return $ catMaybes $ buildHeader <$> headersStrings
 
 
@@ -260,15 +253,15 @@ buildHeader :: Text -> Maybe HTTP.Header
 buildHeader xs = parseXs $ splitStr xs
   where splitStr = T.splitOn (":")
         parseXs :: [Text] -> Maybe HTTP.Header
-        parseXs (c:cs) = Just (mk $ encodeUtf8 $ T.strip c, encodeUtf8 $ T.strip $ T.concat cs)
+        parseXs (c:css) = Just (mk $ encodeUtf8 $ T.strip c, encodeUtf8 $ T.strip $ T.concat css)
         parseXs _ = Nothing
 
 bufferByteString :: Int        -- ^ offset from the start in bytes
                  -> Int        -- ^ length in bytes (use zero or a negative number to get the whole ArrayBuffer)
                  -> JSVal
                  -> IO BS.ByteString
-bufferByteString offset length buf = do
-  (ByteArray ba) <- wrapBuffer offset length buf
+bufferByteString offset l buf = do
+  (ByteArray ba) <- wrapBuffer offset l buf
   byteArrayByteString ba
 
 byteArrayByteString :: ByteArray# -> IO BS.ByteString
@@ -290,7 +283,7 @@ wrapBuffer offset size buf = unsafeCoerce <$> js_wrapBuffer offset size buf
 {-# INLINE wrapBuffer #-}
 
 makeRequest :: Method -> Req -> (Int -> Bool) -> Maybe BaseUrl -> IO (Either ServantError (Int, [HTTP.Header], JSVal))
-makeRequest method req isWantedStatus bUrl = do
+makeRequest method req isWantedStatus_ bUrl = do
   jRequest <- jsXhrRequest
   let url = JSString.pack . show  $ buildUrl req bUrl
       methodText = JSString.pack $ unpack method
@@ -301,17 +294,17 @@ makeRequest method req isWantedStatus bUrl = do
     r <- jsXhrReadyState jRequest :: IO JSVal
     state <- fromJSVal r
     when ((state :: Maybe Int) == Just 4) $ do
-      statusCode <- fromMaybe (-1) <$> (fromJSVal =<< jsXhrStatus jRequest)
-      if (statusCode >= 200 && statusCode < 300)
+      statusCode' <- fromMaybe (-1) <$> (fromJSVal =<< jsXhrStatus jRequest)
+      if (statusCode' >= 200 && statusCode' < 300)
         then do
           bsResp <- jsXhrResponse jRequest
-          headers <- xhrResponseHeaders jRequest
-          putMVar resp $ Right (statusCode, headers, bsResp)
+          headers' <- xhrResponseHeaders jRequest
+          putMVar resp $ Right (statusCode', headers', bsResp)
         else do
           bsStatusText <- jsXhrGetStatusText jRequest
           respBody <- jsXhrResponse jRequest
           [js_| console.log(`respBody); |]
-          putMVar resp $ Left $ FailureResponse (mkStatus statusCode .
+          putMVar resp $ Left $ FailureResponse (mkStatus statusCode' .
                                                        pack . JSString.unpack $ bsStatusText)
                                                 ("unknown" // "unknown")
                                                 (respBody)
@@ -332,19 +325,19 @@ release :: Callback (IO ()) -- ^ the callback
 release = js_release
 
 buildUrl :: Req -> Maybe BaseUrl -> URI
-buildUrl req@(Req path qText mBody rAccept hs) baseurl =
-  (baseURI baseurl){uriPath = path, uriQuery = query}
+buildUrl (Req path qText _ _ _) baseurl =
+  (baseURI baseurl){uriPath = path, uriQuery = query'}
   where
-    query = unpack $ renderQuery True $ queryTextToQuery qText
+    query' = unpack $ renderQuery True $ queryTextToQuery qText
     baseURI Nothing = nullURI
-    baseURI (Just (BaseUrl scheme host port)) =
+    baseURI (Just (BaseUrl scheme' host port)) =
       nullURI {
         uriScheme = schemeText,
         uriAuthority = Just $ URIAuth "" host portText
       }
       where
         portText = ":" <> (show port)
-        schemeText = case scheme of
+        schemeText = case scheme' of
                             Http -> "http:"
                             Https -> "https:"
 class Accept ctype => GHCJSUnrender ctype a where
