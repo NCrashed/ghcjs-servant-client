@@ -289,6 +289,7 @@ makeRequest method req isWantedStatus_ bUrl = do
       methodText = JSString.pack $ unpack method
   jsXhrOpen jRequest methodText url jsTrue
   jsXhrResponseType jRequest "json"
+  setHeaders jRequest
   resp <- newEmptyMVar
   cb <- syncCallback ThrowWouldBlock $ do
     r <- jsXhrReadyState jRequest :: IO JSVal
@@ -319,6 +320,9 @@ makeRequest method req isWantedStatus_ bUrl = do
   res <- takeMVar resp
   release cb
   return res
+  where 
+  setHeaders jRequest = forM_ (headers req) $ \(k, v) -> 
+    jsXhrSetRequestHeader jRequest (JSString.pack k) (JSString.pack $ T.unpack v)
 
 release :: Callback (IO ()) -- ^ the callback
                  -> IO ()
